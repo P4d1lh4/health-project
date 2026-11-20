@@ -92,11 +92,13 @@ def model_panel(artifacts: ModelArtifacts | None, metrics: dict[str, Any] | None
     if metrics is None:
         return
     test = metrics["test"]
-    cols = st.columns(4)
-    cols[0].metric("ROC-AUC (teste)", f"{test['roc_auc']:.3f}")
-    cols[1].metric("PR-AUC (teste)", f"{test['pr_auc']:.3f}", help=f"Prevalência: {test['prevalence']:.3f}")
-    cols[2].metric("Brier (teste)", f"{test['brier']:.4f}")
-    cols[3].metric("Limiar", f"{artifacts.threshold:.3f}")
+    # Duas por linha: com quatro lado a lado os valores são cortados em telas estreitas.
+    top = st.columns(2)
+    top[0].metric("ROC-AUC (teste)", f"{test['roc_auc']:.3f}")
+    top[1].metric("PR-AUC (teste)", f"{test['pr_auc']:.3f}", help=f"Prevalência: {test['prevalence']:.3f}")
+    bottom = st.columns(2)
+    bottom[0].metric("Brier (teste)", f"{test['brier']:.3f}")
+    bottom[1].metric("Limiar", f"{artifacts.threshold:.3f}")
     st.caption(
         f"No limiar: precisão {test['precision']:.3f}, recall {test['recall']:.3f}, F1 {test['f1']:.3f}. "
         f"{metrics['split']}."
@@ -112,16 +114,14 @@ def main() -> None:
     kaggle_download_panel()
     df = cached_dataset(data_path) if Path(data_path).exists() else None
 
-    col1, col2 = st.columns(2)
-    with col1:
-        model_panel(artifacts, load_metrics())
-    with col2:
-        st.subheader("Importância por Permutação (queda de ROC-AUC)")
-        importances = load_importances()
-        if importances is None or importances.empty:
-            st.info("Importâncias não disponíveis.")
-        else:
-            st.dataframe(importances.head(20))
+    model_panel(artifacts, load_metrics())
+
+    st.subheader("Importância por Permutação (queda de ROC-AUC)")
+    importances = load_importances()
+    if importances is None or importances.empty:
+        st.info("Importâncias não disponíveis.")
+    else:
+        st.dataframe(importances.head(20))
 
     st.subheader("EDA Rápida")
     if df is None:
