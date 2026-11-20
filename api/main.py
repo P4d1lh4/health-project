@@ -1,69 +1,87 @@
 from __future__ import annotations
 
-import json
+import logging
 import os
-from typing import Any, Dict, Optional
+from contextlib import asynccontextmanager
+from pathlib import Path
+from typing import Any, AsyncIterator, Optional
 
-import pandas as pd
-from fastapi import FastAPI, HTTPException, Body
-from joblib import load
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, ConfigDict, NonNegativeInt, create_model
 
+from src.artifacts import ModelArtifacts, artifacts_exist, load_artifacts
+from src.feature_engineering import RAW_INPUT_SCHEMA, InputKind
 
-APP_TITLE = "Hospital Readmission Prediction API"
-APP_VERSION = "0.1.0"
-MODEL_PATH = os.path.join("models", "best_model.joblib")
-METADATA_PATH = os.path.join("models", "metadata.json")
+APP_TITLE = "API de Previsão de Readmissão Hospitalar"
+APP_VERSION = "0.2.0"
+DEFAULT_MODEL_DIR = Path(__file__).resolve().parents[1] / "models"
 
-app = FastAPI(title=APP_TITLE, version=APP_VERSION)
+logger = logging.getLogger(__name__)
 
-_PIPELINE = None
-_RAW_FEATURE_COLS = None
-_MODEL_NAME = None
+_FIELD_TYPES: dict[InputKind, Any] = {
+    InputKind.COUNT: Optional[NonNegativeInt],
+    InputKind.CODE: Optional[int],
+    InputKind.CATEGORY: Optional[str],
+}
 
-
-def _load_artifacts() -> None:
-	global _PIPELINE, _RAW_FEATURE_COLS, _MODEL_NAME
-	if not os.path.exists(MODEL_PATH) or not os.path.exists(METADATA_PATH):
-		return
-	_PIPELINE = load(MODEL_PATH)
-	with open(METADATA_PATH, "r", encoding="utf-8") as f:
-		meta = json.load(f)
-	_MODEL_NAME = meta.get("best_model_name")
-	_RAW_FEATURE_COLS = meta.get("raw_feature_columns", [])
-
-
-@app.on_event("startup")
-def on_startup() -> None:
-	_load_artifacts()
+PatientRecord = create_model(
+    "PatientRecord",
+    __config__=ConfigDict(
+        extra="forbid",
+        json_schema_extra={"examples": [{c.name: c.example for c in RAW_INPUT_SCHEMA}]},
+    ),
+    **{c.name: (_FIELD_TYPES[c.kind], None) for c in RAW_INPUT_SCHEMA},
+)
 
 
-@app.get("/health")
-def health() -> Dict[str, Any]:
-	status = "ok" if _PIPELINE is not None else "model_not_loaded"
-	return {"status": status, "model": _MODEL_NAME}
+class PredictionResponse(BaseModel):
+    model: str
+    probability_readmit_30: float
+    threshold: float
+    prediction: int
 
 
-@app.post("/predict")
-def predict(payload: Dict[str, Any] = Body(...)) -> Dict[str, Any]:
-	if _PIPELINE is None or _RAW_FEATURE_COLS is None:
-		raise HTTPException(status_code=503, detail="Modelo não carregado. Treine o modelo primeiro.")
+def create_app(model_dir: Path) -> FastAPI:
+    @asynccontextmanager
+    async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        if artifacts_exist(model_dir):
+            app.state.artifacts = load_artifacts(model_dir)
+        else:
+            logger.warning("Artefatos não encontrados em %s; /predict responderá 503.", model_dir)
+            app.state.artifacts = None
+        yield
 
-	# Constrói DataFrame com as colunas esperadas
-	row = {}
-	for c in _RAW_FEATURE_COLS:
-		row[c] = payload.get(c, None)
-	X = pd.DataFrame([row])
+    app = FastAPI(title=APP_TITLE, version=APP_VERSION, lifespan=lifespan)
 
-	try:
-		proba = float(_PIPELINE.predict_proba(X)[:, 1][0])
-		pred = int(proba >= 0.5)
-	except Exception as e:
-		raise HTTPException(status_code=400, detail=f"Erro ao inferir: {e}")
+    def _artifacts(request: Request) -> ModelArtifacts:
+        artifacts: ModelArtifacts | None = request.app.state.artifacts
+        if artifacts is None:
+            raise HTTPException(status_code=503, detail="Modelo não carregado. Treine o modelo primeiro.")
+        return artifacts
 
-	return {
-		"model": _MODEL_NAME,
-		"probability_readmit_30": proba,
-		"prediction": pred,
-	}
+    @app.get("/health")
+    def health(request: Request) -> dict[str, Any]:
+        artifacts: ModelArtifacts | None = request.app.state.artifacts
+        if artifacts is None:
+            return {"status": "model_not_loaded", "model": None}
+        return {"status": "ok", "model": artifacts.model_name, "threshold": artifacts.threshold}
+
+    @app.post("/predict", response_model=PredictionResponse)
+    def predict(record: PatientRecord, request: Request) -> PredictionResponse:  # type: ignore[valid-type]
+        artifacts = _artifacts(request)
+        try:
+            result = artifacts.predict(record.model_dump())
+        except Exception:
+            logger.exception("Falha na inferência")
+            raise HTTPException(status_code=500, detail="Erro interno ao calcular a predição.")
+        return PredictionResponse(
+            model=artifacts.model_name,
+            probability_readmit_30=result.probability,
+            threshold=result.threshold,
+            prediction=result.prediction,
+        )
+
+    return app
 
 
+app = create_app(Path(os.environ.get("MODEL_DIR", DEFAULT_MODEL_DIR)))
