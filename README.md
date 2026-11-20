@@ -209,6 +209,29 @@ Resposta: `model`, `probability_readmit_30`, `threshold` e `prediction` (1 se a 
 streamlit run dashboard/app.py
 ```
 
+<p align="center">
+  <img src="docs/img/dashboard-panorama.png" alt="Aba Panorama do dashboard: indicadores da coorte, taxa de readmissão por internações no ano anterior e por destino da alta" width="100%"/>
+</p>
+
+<table>
+  <tr>
+    <td width="50%" align="center"><img src="docs/img/dashboard-fatores.png" alt="Aba Fatores de risco: taxa de readmissão por variável, participação de cada grupo e os dez segmentos de maior risco"/></td>
+    <td width="50%" align="center"><img src="docs/img/dashboard-desempenho.png" alt="Aba Desempenho do modelo: métricas no teste, faixas de risco, calibração, comparação dos modelos e importância das colunas"/></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Fatores de risco</b></sub></td>
+    <td align="center"><sub><b>Desempenho do modelo</b></sub></td>
+  </tr>
+  <tr>
+    <td width="50%" align="center"><img src="docs/img/dashboard-limiar.png" alt="Aba Limiar e capacidade: controle da parcela de altas acompanhadas, com precisão, recall e readmissões encontradas a cada mil altas"/></td>
+    <td width="50%" align="center"><img src="docs/img/dashboard-paciente.png" alt="Aba Paciente: risco previsto para uma alta e os atributos que mais pesaram na previsão"/></td>
+  </tr>
+  <tr>
+    <td align="center"><sub><b>Limiar e capacidade</b></sub></td>
+    <td align="center"><sub><b>Paciente</b></sub></td>
+  </tr>
+</table>
+
 Rode a partir da raiz do projeto, para o tema em `.streamlit/config.toml` ser aplicado. O painel precisa do dataset em `data/` e do treino já executado.
 
 Uma linha de filtros (faixa etária, tipo de admissão e gênero) recorta os indicadores do topo e as duas primeiras abas.
