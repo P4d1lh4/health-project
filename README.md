@@ -35,7 +35,7 @@ Health-Project/
 ## Setup (Windows/PowerShell)
 
 ```powershell
-cd C:\Users\Site5\Health-Project
+cd health-project
 python -m venv .venv
 .venv\Scripts\Activate.ps1
 pip install --upgrade pip
