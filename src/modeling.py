@@ -36,6 +36,7 @@ MODEL_FILENAME = "best_model.joblib"
 METADATA_FILENAME = "metadata.json"
 METRICS_FILENAME = "metrics.json"
 IMPORTANCE_FILENAME = "feature_importance.csv"
+PREDICTIONS_FILENAME = "test_predictions.csv"
 
 CV_FOLDS = 5
 # Categorias com menos de 0,1% das linhas viram "infrequent" (ex.: medical_specialty raras).
@@ -206,7 +207,8 @@ def train_and_save(
 ) -> dict[str, Any]:
     """
     Seleciona o modelo por validação cruzada agrupada, escolhe o limiar, reajusta
-    no treino completo, avalia uma vez no teste e grava os quatro artefatos.
+    no treino completo, avalia uma vez no teste e grava os artefatos, incluindo
+    as probabilidades previstas no teste.
     """
     candidates = classifiers if classifiers is not None else candidate_classifiers(random_state)
     train, test = split_by_patient(cohort, test_size, random_state)
@@ -224,7 +226,9 @@ def train_and_save(
     X_test = test[list(RAW_INPUT_COLUMNS)]
     y_test = test[TARGET_COLUMN].to_numpy()
     pipeline = build_pipeline(candidates[best_name]).fit(X_train, y_train)
-    test_metrics = evaluate(y_test, pipeline.predict_proba(X_test)[:, 1], threshold)
+    test_proba = pipeline.predict_proba(X_test)[:, 1]
+    test_metrics = evaluate(y_test, test_proba, threshold)
+    predictions = pd.DataFrame({"y_true": y_test, "proba": test_proba})
     importances = compute_permutation_importances(pipeline, X_test, y_test, random_state)
 
     counts = {
@@ -261,4 +265,5 @@ def train_and_save(
     _write_json(model_dir / METADATA_FILENAME, metadata)
     _write_json(reports_dir / METRICS_FILENAME, metrics)
     importances.to_csv(reports_dir / IMPORTANCE_FILENAME, index=False, encoding="utf-8")
+    predictions.to_csv(reports_dir / PREDICTIONS_FILENAME, index=False, encoding="utf-8")
     return metrics

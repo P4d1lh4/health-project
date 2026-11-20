@@ -57,3 +57,8 @@ def test_metadata_and_reports(trained_model_dir: Path) -> None:
     assert metadata["raw_input_columns"] == list(RAW_INPUT_COLUMNS)
     assert metadata["threshold"] == metrics["test"]["threshold"]
     assert sorted(importances["feature"]) == sorted(RAW_INPUT_COLUMNS)
+
+    predictions = pd.read_csv(reports_dir / "test_predictions.csv")
+    assert len(predictions) == metrics["test_rows"]
+    assert predictions["y_true"].mean() == metrics["test"]["prevalence"]
+    assert predictions["proba"].between(0, 1).all()

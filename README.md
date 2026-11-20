@@ -20,7 +20,10 @@ Health-Project/
 ├─ api/
 │  └─ main.py               # FastAPI
 ├─ dashboard/
-│  └─ app.py                # Streamlit
+│  ├─ app.py                # Streamlit: filtros, indicadores e abas
+│  ├─ views.py              # conteúdo das abas de análise
+│  ├─ patient.py            # formulário e resultado de um paciente
+│  └─ charts.py             # gráficos (Altair)
 ├─ notebooks/
 │  ├─ 01_eda.ipynb          # exploração dos dados
 │  └─ 02_modelo_shap.ipynb  # calibração, limiar e SHAP
@@ -60,6 +63,7 @@ Saídas:
 - `models/metadata.json`: modelo vencedor, colunas de entrada, limiar de decisão, versão do scikit-learn, contagens de linhas/pacientes e data do treino.
 - `reports/metrics.json`: métricas de validação cruzada por candidato e métricas no conjunto de teste.
 - `reports/feature_importance.csv`: importância por permutação (queda de ROC-AUC) de cada coluna de entrada, medida no teste.
+- `reports/test_predictions.csv`: alvo real e probabilidade prevista de cada atendimento do teste, usado pelo dashboard.
 
 ### Baixar automaticamente do Kaggle
 
@@ -129,11 +133,19 @@ Resposta: `model`, `probability_readmit_30`, `threshold` e `prediction` (1 se a 
 streamlit run dashboard/app.py
 ```
 
-Recursos:
-- Formulário de predição com todas as colunas de entrada do modelo, decidindo pelo limiar salvo
-- ROC-AUC, PR-AUC, Brier e limiar do conjunto de teste, e importâncias por permutação
-- EDA rápida se o dataset estiver em `data/`
-- Expansor "Baixar do Kaggle" na barra lateral
+Rode a partir da raiz do projeto, para o tema em `.streamlit/config.toml` ser aplicado. O painel precisa do dataset em `data/` e do treino já executado.
+
+Uma linha de filtros (faixa etária, tipo de admissão e gênero) recorta os indicadores do topo e as duas primeiras abas.
+
+| Aba | Pergunta que responde |
+|---|---|
+| Panorama | Onde a readmissão se concentra: por internações anteriores e por destino da alta. |
+| Fatores de risco | Como a taxa varia em cada variável, quanto cada grupo pesa no volume e quais são os dez grupos de maior taxa. |
+| Desempenho do modelo | O modelo ordena o risco, as probabilidades batem com o observado, qual candidato venceu e quais colunas carregam o sinal. |
+| Limiar e capacidade | Dada a parcela de altas que a equipe consegue acompanhar, quantas readmissões são encontradas e perdidas a cada mil altas. |
+| Paciente | Risco previsto para uma alta, comparação com a média e os atributos que mais pesaram na previsão. |
+
+Cada gráfico tem a tabela correspondente em "Ver dados". O código está em `dashboard/` (telas e gráficos) e em `src/analysis.py`, `src/dimensions.py`, `src/labels.py` e `src/explain.py` (cálculos, com testes).
 
 ## Notas de Modelagem
 - Alvo binário: `readmit_30 = 1` se `readmitted == "<30"`, caso contrário `0`.
