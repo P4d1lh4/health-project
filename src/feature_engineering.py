@@ -1,128 +1,155 @@
 from __future__ import annotations
 
-from typing import Optional
+import re
+from dataclasses import dataclass
+from enum import Enum
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 
 
-def _parse_icd_as_float(code: Optional[str]) -> Optional[float]:
-	if code is None or (isinstance(code, float) and np.isnan(code)):
-		return None
-	try:
-		return float(str(code).strip())
-	except Exception:
-		return None
+class InputKind(Enum):
+    """Tipo de cada coluna bruta aceita pelo modelo."""
+
+    COUNT = "count"
+    CODE = "code"
+    CATEGORY = "category"
 
 
-def map_icd_to_group(code: Optional[str]) -> str:
-	"""
-	Mapeia um código ICD para um grupo clínico amplo.
-	Regras aproximadas usadas na literatura do dataset:
-	- 390–459, 785: circulatory
-	- 460–519, 786: respiratory
-	- 520–579, 787: digestive
-	- 250: diabetes
-	- 800–999: injury
-	- 710–739: musculoskeletal
-	- 580–629: genitourinary
-	- 140–239: neoplasms
-	- E/V codes: other
-	- caso contrário: other
-	"""
-	if code is None or (isinstance(code, float) and np.isnan(code)):
-		return "other"
-	s = str(code).strip().upper()
-
-	# E/V codes
-	if s.startswith("E") or s.startswith("V"):
-		return "other"
-
-	num = _parse_icd_as_float(s)
-	if num is None:
-		return "other"
-
-	if 390 <= num <= 459 or num == 785:
-		return "circulatory"
-	if 460 <= num <= 519 or num == 786:
-		return "respiratory"
-	if 520 <= num <= 579 or num == 787:
-		return "digestive"
-	if 250 <= num < 251:
-		return "diabetes"
-	if 800 <= num <= 999:
-		return "injury"
-	if 710 <= num <= 739:
-		return "musculoskeletal"
-	if 580 <= num <= 629:
-		return "genitourinary"
-	if 140 <= num <= 239:
-		return "neoplasms"
-	return "other"
+@dataclass(frozen=True)
+class InputColumn:
+    name: str
+    kind: InputKind
+    example: str | int
 
 
-def add_diagnosis_groups(df: pd.DataFrame) -> pd.DataFrame:
-	df = df.copy()
-	for col in ["diag_1", "diag_2", "diag_3"]:
-		if col in df.columns:
-			df[f"{col}_group"] = df[col].apply(map_icd_to_group)
-	return df
+# Contrato único entre treino, API e dashboard: colunas brutas do CSV que o modelo consome.
+RAW_INPUT_SCHEMA: tuple[InputColumn, ...] = (
+    InputColumn("age", InputKind.CATEGORY, "[60-70)"),
+    InputColumn("gender", InputKind.CATEGORY, "Female"),
+    InputColumn("race", InputKind.CATEGORY, "Caucasian"),
+    InputColumn("admission_type_id", InputKind.CODE, 1),
+    InputColumn("discharge_disposition_id", InputKind.CODE, 1),
+    InputColumn("admission_source_id", InputKind.CODE, 7),
+    InputColumn("time_in_hospital", InputKind.COUNT, 5),
+    InputColumn("num_lab_procedures", InputKind.COUNT, 40),
+    InputColumn("num_procedures", InputKind.COUNT, 1),
+    InputColumn("num_medications", InputKind.COUNT, 12),
+    InputColumn("number_outpatient", InputKind.COUNT, 1),
+    InputColumn("number_emergency", InputKind.COUNT, 0),
+    InputColumn("number_inpatient", InputKind.COUNT, 0),
+    InputColumn("number_diagnoses", InputKind.COUNT, 9),
+    InputColumn("A1Cresult", InputKind.CATEGORY, "None"),
+    InputColumn("max_glu_serum", InputKind.CATEGORY, "None"),
+    InputColumn("insulin", InputKind.CATEGORY, "Steady"),
+    InputColumn("metformin", InputKind.CATEGORY, "No"),
+    InputColumn("glyburide", InputKind.CATEGORY, "No"),
+    InputColumn("glipizide", InputKind.CATEGORY, "No"),
+    InputColumn("pioglitazone", InputKind.CATEGORY, "No"),
+    InputColumn("rosiglitazone", InputKind.CATEGORY, "No"),
+    InputColumn("change", InputKind.CATEGORY, "Ch"),
+    InputColumn("diabetesMed", InputKind.CATEGORY, "Yes"),
+    InputColumn("diag_1", InputKind.CATEGORY, "428"),
+    InputColumn("diag_2", InputKind.CATEGORY, "250.01"),
+    InputColumn("diag_3", InputKind.CATEGORY, "401"),
+    InputColumn("medical_specialty", InputKind.CATEGORY, "InternalMedicine"),
+)
+
+RAW_INPUT_COLUMNS: tuple[str, ...] = tuple(c.name for c in RAW_INPUT_SCHEMA)
+EXAMPLE_INPUT: dict[str, str | int] = {c.name: c.example for c in RAW_INPUT_SCHEMA}
+
+DIAGNOSIS_COLUMNS = ("diag_1", "diag_2", "diag_3")
+COUNT_COLUMNS = tuple(c.name for c in RAW_INPUT_SCHEMA if c.kind is InputKind.COUNT)
+PASSTHROUGH_CATEGORY_COLUMNS = tuple(
+    c.name
+    for c in RAW_INPUT_SCHEMA
+    if c.kind is not InputKind.COUNT and c.name not in DIAGNOSIS_COLUMNS and c.name != "age"
+)
+
+NUMERIC_FEATURES: tuple[str, ...] = ("age_mid", *COUNT_COLUMNS, "medication_ratio", "prior_visits")
+CATEGORICAL_FEATURES: tuple[str, ...] = (
+    *PASSTHROUGH_CATEGORY_COLUMNS,
+    *(f"{c}_group" for c in DIAGNOSIS_COLUMNS),
+)
+
+# Faixas de ICD-9 usadas por Strack et al. (2014), artigo de origem do dataset.
+_ICD9_NUMERIC_GROUPS: tuple[tuple[float, float, str], ...] = (
+    (390, 460, "circulatory"),
+    (785, 786, "circulatory"),
+    (460, 520, "respiratory"),
+    (786, 787, "respiratory"),
+    (520, 580, "digestive"),
+    (787, 788, "digestive"),
+    (250, 251, "diabetes"),
+    (800, 1000, "injury"),
+    (710, 740, "musculoskeletal"),
+    (580, 630, "genitourinary"),
+    (788, 789, "genitourinary"),
+    (140, 240, "neoplasms"),
+)
+
+_AGE_RANGE = re.compile(r"^\[(\d+)-(\d+)\)$")
 
 
-def add_derived_features(df: pd.DataFrame) -> pd.DataFrame:
-	df = df.copy()
-
-	# medication_ratio
-	if "num_medications" in df.columns:
-		den = df["time_in_hospital"].replace(0, 1) if "time_in_hospital" in df.columns else 1
-		df["medication_ratio"] = df["num_medications"] / den
-
-	# prior_visits
-	components = []
-	for c in ["number_outpatient", "number_emergency", "number_inpatient"]:
-		if c in df.columns:
-			components.append(df[c].fillna(0))
-	if components:
-		df["prior_visits"] = sum(components)
-
-	return df
+def parse_age_to_midpoint(age: object) -> float:
+    """Converte a faixa etária do dataset (ex.: "[60-70)") no ponto médio (65.0); NaN se inválida."""
+    if not isinstance(age, str):
+        return np.nan
+    match = _AGE_RANGE.match(age.strip())
+    if match is None:
+        return np.nan
+    low, high = (float(g) for g in match.groups())
+    return (low + high) / 2.0
 
 
-def add_age_groups(df: pd.DataFrame) -> pd.DataFrame:
-	df = df.copy()
-	# se age_mid não existir, tenta criar a partir de age
-	if "age_mid" not in df.columns and "age" in df.columns:
-		from .data_loading import parse_age_to_midpoint
-		df["age_mid"] = df["age"].apply(parse_age_to_midpoint)
-
-	# Faixas: [0–30], [30–60], [60+]
-	def _bucket_age(x: Optional[float]) -> str:
-		try:
-			if x is None or np.isnan(x):
-				return "unknown"
-			if x < 30:
-				return "0-30"
-			if x < 60:
-				return "30-60"
-			return "60+"
-		except Exception:
-			return "unknown"
-
-	if "age_mid" in df.columns:
-		df["age_group_buckets"] = df["age_mid"].apply(_bucket_age)
-	return df
+def map_icd_to_group(code: object) -> str:
+    """Mapeia um código ICD-9 para um grupo clínico amplo; "missing" se ausente."""
+    if code is None or (isinstance(code, float) and np.isnan(code)):
+        return "missing"
+    text = str(code).strip().upper()
+    if not text:
+        return "missing"
+    if text.startswith(("E", "V")):
+        return "other"
+    try:
+        value = float(text)
+    except ValueError:
+        return "other"
+    for low, high, group in _ICD9_NUMERIC_GROUPS:
+        if low <= value < high:
+            return group
+    return "other"
 
 
-def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
-	"""
-	Pipeline de engenharia de atributos:
-	- grupos de diagnóstico (ICD)
-	- variáveis derivadas (medication_ratio, prior_visits)
-	- faixas etárias
-	"""
-	df = add_diagnosis_groups(df)
-	df = add_derived_features(df)
-	df = add_age_groups(df)
-	return df
+def _as_category(series: pd.Series) -> pd.Series:
+    # NaN (e não None) para o SimpleImputer reconhecer o valor ausente em colunas object.
+    return series.map(lambda v: np.nan if pd.isna(v) else str(v)).astype(object)
 
 
+def engineer_features(raw: pd.DataFrame) -> pd.DataFrame:
+    """
+    Recebe colunas brutas de RAW_INPUT_COLUMNS (colunas ausentes viram NaN) e
+    devolve o DataFrame de atributos que o modelo consome. Não altera `raw`.
+    """
+    frame = raw.reindex(columns=list(RAW_INPUT_COLUMNS))
+    counts = frame[list(COUNT_COLUMNS)].apply(pd.to_numeric, errors="coerce")
+
+    numeric = pd.DataFrame(
+        {
+            "age_mid": frame["age"].map(parse_age_to_midpoint).astype(float),
+            **{c: counts[c] for c in COUNT_COLUMNS},
+            "medication_ratio": counts["num_medications"] / counts["time_in_hospital"].clip(lower=1),
+            "prior_visits": counts[["number_outpatient", "number_emergency", "number_inpatient"]].sum(
+                axis=1, min_count=1
+            ),
+        },
+        index=frame.index,
+    )
+    categorical = pd.DataFrame(
+        {
+            **{c: _as_category(frame[c]) for c in PASSTHROUGH_CATEGORY_COLUMNS},
+            **{f"{c}_group": frame[c].map(map_icd_to_group).astype(object) for c in DIAGNOSIS_COLUMNS},
+        },
+        index=frame.index,
+    )
+    return pd.concat([numeric, categorical], axis=1)[[*NUMERIC_FEATURES, *CATEGORICAL_FEATURES]]
