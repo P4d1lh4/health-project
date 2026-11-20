@@ -1,332 +1,264 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Dict, List, Tuple, Any, Optional
 import json
-import os
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pandas as pd
+import sklearn
+from joblib import dump
+from sklearn.base import BaseEstimator, clone
 from sklearn.compose import ColumnTransformer
+from sklearn.ensemble import RandomForestClassifier
 from sklearn.impute import SimpleImputer
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, StandardScaler
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import (
-	roc_auc_score,
-	roc_curve,
-	precision_recall_fscore_support,
-	confusion_matrix,
-	classification_report,
-)
 from sklearn.inspection import permutation_importance
 from sklearn.linear_model import LogisticRegression
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.svm import SVC
-from joblib import dump
+from sklearn.metrics import (
+    average_precision_score,
+    brier_score_loss,
+    confusion_matrix,
+    precision_recall_curve,
+    precision_recall_fscore_support,
+    roc_auc_score,
+)
+from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import FunctionTransformer, OneHotEncoder, StandardScaler
+from xgboost import XGBClassifier
 
-try:
-	from xgboost import XGBClassifier
-except Exception:  # pragma: no cover
-	XGBClassifier = None  # type: ignore
+from .data_loading import GROUP_COLUMN, TARGET_COLUMN
+from .feature_engineering import CATEGORICAL_FEATURES, NUMERIC_FEATURES, RAW_INPUT_COLUMNS, engineer_features
 
-try:
-	from lightgbm import LGBMClassifier
-except Exception:  # pragma: no cover
-	LGBMClassifier = None  # type: ignore
+MODEL_FILENAME = "best_model.joblib"
+METADATA_FILENAME = "metadata.json"
+METRICS_FILENAME = "metrics.json"
+IMPORTANCE_FILENAME = "feature_importance.csv"
 
-
-MODEL_DIR = "models"
-REPORTS_DIR = "reports"
-os.makedirs(MODEL_DIR, exist_ok=True)
-os.makedirs(REPORTS_DIR, exist_ok=True)
-
-
-def select_feature_columns(df: pd.DataFrame) -> List[str]:
-	"""
-	Seleciona um conjunto de colunas de entrada robusto e disponível no dataset.
-	Preferimos colunas coesas e com boa capacidade explicativa.
-	"""
-	candidates = [
-		# demografia e tempo de internação
-		"age_mid",
-		"time_in_hospital",
-		# procedimentos e exames
-		"num_lab_procedures",
-		"num_procedures",
-		"num_medications",
-		# histórico recente
-		"number_outpatient",
-		"number_emergency",
-		"number_inpatient",
-		# resultados laboratoriais discretos
-		"A1Cresult",
-		"max_glu_serum",
-		# medicamentos chave
-		"insulin",
-		"metformin",
-		"glyburide",
-		"glipizide",
-		"pioglitazone",
-		"rosiglitazone",
-		"change",
-		"diabetesMed",
-		# engenharia de atributos
-		"medication_ratio",
-		"prior_visits",
-		"age_group_buckets",
-		# grupos de diagnóstico
-		"diag_1_group",
-		"diag_2_group",
-		"diag_3_group",
-	]
-	return [c for c in candidates if c in df.columns]
+CV_FOLDS = 5
+# Categorias com menos de 0,1% das linhas viram "infrequent" (ex.: medical_specialty raras).
+MIN_CATEGORY_FREQUENCY = 0.001
+PERMUTATION_REPEATS = 3
 
 
-def split_data(
-	df: pd.DataFrame,
-	target_col: str = "readmit_30",
-	test_size: float = 0.2,
-	random_state: int = 42,
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.Series, pd.Series]:
-	X = df.drop(columns=[target_col])
-	y = df[target_col]
-	return train_test_split(X, y, test_size=test_size, random_state=random_state, stratify=y)
+def candidate_classifiers(random_state: int) -> dict[str, BaseEstimator]:
+    """Sem class_weight: o desbalanceamento é tratado pelo limiar e pela PR-AUC."""
+    return {
+        "LogisticRegression": LogisticRegression(max_iter=2000),
+        "RandomForest": RandomForestClassifier(
+            n_estimators=300, min_samples_leaf=20, n_jobs=-1, random_state=random_state
+        ),
+        "XGBoost": XGBClassifier(
+            n_estimators=400,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            tree_method="hist",
+            eval_metric="logloss",
+            n_jobs=-1,
+            random_state=random_state,
+        ),
+    }
 
 
-def build_preprocessor(X: pd.DataFrame, raw_feature_cols: List[str]) -> Tuple[ColumnTransformer, List[str], List[str]]:
-	"""
-	Cria um ColumnTransformer com:
-	- numéricas: imputer (median) + scaler
-	- categóricas: imputer (constant) + one-hot
-	Retorna o preprocessor e as listas de colunas numéricas/categóricas usadas.
-	"""
-	X = X.copy()
-	X = X[raw_feature_cols]
-	numeric_cols = [c for c in raw_feature_cols if pd.api.types.is_numeric_dtype(X[c])]
-	categorical_cols = [c for c in raw_feature_cols if c not in numeric_cols]
-
-	numeric_transformer = Pipeline(steps=[
-		("imputer", SimpleImputer(strategy="median")),
-		("scaler", StandardScaler()),
-	])
-	categorical_transformer = Pipeline(steps=[
-		("imputer", SimpleImputer(strategy="most_frequent")),
-		("onehot", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),
-	])
-
-	preprocessor = ColumnTransformer(
-		transformers=[
-			("num", numeric_transformer, numeric_cols),
-			("cat", categorical_transformer, categorical_cols),
-		]
-	)
-	return preprocessor, numeric_cols, categorical_cols
-
-
-def get_models() -> Dict[str, Any]:
-	models: Dict[str, Any] = {
-		"LogisticRegression": LogisticRegression(max_iter=1000, n_jobs=None),
-		"RandomForest": RandomForestClassifier(n_estimators=300, random_state=42, n_jobs=-1),
-		"SVM": SVC(probability=True, kernel="rbf", C=1.0, gamma="scale", random_state=42),
-	}
-	if XGBClassifier is not None:
-		models["XGBoost"] = XGBClassifier(
-			n_estimators=400,
-			max_depth=6,
-			learning_rate=0.05,
-			subsample=0.8,
-			colsample_bytree=0.8,
-			reg_lambda=1.0,
-			random_state=42,
-			eval_metric="logloss",
-		)
-	if LGBMClassifier is not None:
-		models["LightGBM"] = LGBMClassifier(
-			n_estimators=400,
-			num_leaves=31,
-			learning_rate=0.05,
-			subsample=0.8,
-			colsample_bytree=0.8,
-			reg_lambda=1.0,
-			random_state=42,
-		)
-	return models
+def build_pipeline(classifier: BaseEstimator) -> Pipeline:
+    """Pipeline completo: colunas brutas -> atributos -> pré-processamento -> classificador."""
+    numeric = Pipeline(
+        steps=[("imputer", SimpleImputer(strategy="median")), ("scaler", StandardScaler())]
+    )
+    categorical = Pipeline(
+        steps=[
+            ("imputer", SimpleImputer(strategy="constant", fill_value="missing")),
+            (
+                "onehot",
+                OneHotEncoder(handle_unknown="infrequent_if_exist", min_frequency=MIN_CATEGORY_FREQUENCY),
+            ),
+        ]
+    )
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ("num", numeric, list(NUMERIC_FEATURES)),
+            ("cat", categorical, list(CATEGORICAL_FEATURES)),
+        ]
+    )
+    return Pipeline(
+        steps=[
+            ("features", FunctionTransformer(engineer_features)),
+            ("preprocessor", preprocessor),
+            ("classifier", clone(classifier)),
+        ]
+    )
 
 
-def evaluate_models(
-	X_train: pd.DataFrame,
-	y_train: pd.Series,
-	X_val: pd.DataFrame,
-	y_val: pd.Series,
-	raw_feature_cols: List[str],
-) -> Tuple[str, Pipeline, Dict[str, float]]:
-	"""
-	Treina e avalia múltiplos modelos, retornando o melhor pelo ROC-AUC.
-	"""
-	preprocessor, _, _ = build_preprocessor(X_train, raw_feature_cols)
-	models = get_models()
+def split_by_patient(
+    cohort: pd.DataFrame, test_size: float, random_state: int
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Separa treino/teste por `patient_nbr`, estratificado pelo alvo; nenhum paciente fica nos dois."""
+    if not 0 < test_size < 0.5:
+        raise ValueError(f"test_size deve estar em (0, 0.5); recebido {test_size}.")
+    n_splits = round(1 / test_size)
+    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    train_idx, test_idx = next(
+        splitter.split(cohort, cohort[TARGET_COLUMN], groups=cohort[GROUP_COLUMN])
+    )
+    return cohort.iloc[train_idx].reset_index(drop=True), cohort.iloc[test_idx].reset_index(drop=True)
 
-	best_name = ""
-	best_pipeline: Optional[Pipeline] = None
-	best_auc = -np.inf
-	scores: Dict[str, float] = {}
 
-	for name, clf in models.items():
-		pipe = Pipeline(steps=[
-			("preprocessor", preprocessor),
-			("classifier", clf),
-		])
-		pipe.fit(X_train[raw_feature_cols], y_train)
-		proba = pipe.predict_proba(X_val[raw_feature_cols])[:, 1]
-		auc = roc_auc_score(y_val, proba)
-		scores[name] = auc
-		if auc > best_auc:
-			best_auc = auc
-			best_name = name
-			best_pipeline = pipe
+@dataclass(frozen=True)
+class CandidateResult:
+    fold_roc_auc: tuple[float, ...]
+    fold_pr_auc: tuple[float, ...]
+    oof_proba: np.ndarray
 
-	assert best_pipeline is not None
-	return best_name, best_pipeline, scores
+    def summary(self) -> dict[str, float]:
+        return {
+            "roc_auc_mean": float(np.mean(self.fold_roc_auc)),
+            "roc_auc_std": float(np.std(self.fold_roc_auc)),
+            "pr_auc_mean": float(np.mean(self.fold_pr_auc)),
+            "pr_auc_std": float(np.std(self.fold_pr_auc)),
+        }
+
+
+def cross_validate_candidate(
+    classifier: BaseEstimator, train: pd.DataFrame, n_splits: int, random_state: int
+) -> CandidateResult:
+    """Validação cruzada agrupada por paciente, com probabilidades out-of-fold."""
+    X = train[list(RAW_INPUT_COLUMNS)]
+    y = train[TARGET_COLUMN].to_numpy()
+    splitter = StratifiedGroupKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    oof = np.full(len(train), np.nan)
+    roc, pr = [], []
+    for fit_idx, val_idx in splitter.split(X, y, groups=train[GROUP_COLUMN]):
+        pipeline = build_pipeline(classifier).fit(X.iloc[fit_idx], y[fit_idx])
+        proba = pipeline.predict_proba(X.iloc[val_idx])[:, 1]
+        oof[val_idx] = proba
+        roc.append(roc_auc_score(y[val_idx], proba))
+        pr.append(average_precision_score(y[val_idx], proba))
+    return CandidateResult(tuple(roc), tuple(pr), oof)
+
+
+def choose_threshold(y_true: np.ndarray, proba: np.ndarray) -> float:
+    """Limiar que maximiza o F1 nas probabilidades out-of-fold."""
+    precision, recall, thresholds = precision_recall_curve(y_true, proba)
+    p, r = precision[:-1], recall[:-1]
+    f1 = np.divide(2 * p * r, p + r, out=np.zeros_like(p), where=(p + r) > 0)
+    return float(thresholds[int(np.argmax(f1))])
+
+
+def evaluate(y_true: np.ndarray, proba: np.ndarray, threshold: float) -> dict[str, Any]:
+    pred = (proba >= threshold).astype(int)
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        y_true, pred, average="binary", zero_division=0
+    )
+    return {
+        "roc_auc": float(roc_auc_score(y_true, proba)),
+        "pr_auc": float(average_precision_score(y_true, proba)),
+        "brier": float(brier_score_loss(y_true, proba)),
+        "prevalence": float(np.mean(y_true)),
+        "threshold": threshold,
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1": float(f1),
+        "confusion_matrix": confusion_matrix(y_true, pred, labels=[0, 1]).tolist(),
+    }
 
 
 def compute_permutation_importances(
-	best_pipeline: Pipeline,
-	X_val: pd.DataFrame,
-	y_val: pd.Series,
-	raw_feature_cols: List[str],
-	max_features: int = 50,
+    pipeline: Pipeline, X: pd.DataFrame, y: np.ndarray, random_state: int
 ) -> pd.DataFrame:
-	"""
-	Calcula permutation importance de forma robusta (modelo-agnóstico).
-	Retorna DataFrame com colunas [feature, importance_mean, importance_std].
-	"""
-	r = permutation_importance(
-		best_pipeline,
-		X_val[raw_feature_cols],
-		y_val,
-		n_repeats=10,
-		random_state=42,
-		n_jobs=-1,
-		scoring="roc_auc",
-	)
-	# Obter nomes expandidos após one-hot
-	# Para simplificar, mapeamos importâncias para colunas "raw" por bloco:
-	# a importância de cada bloco (coluna bruta) = média das importâncias do bloco transformado
-	importances_raw: Dict[str, List[float]] = {c: [] for c in raw_feature_cols}
-	# r.importances_mean está no espaço transformado; não temos nomes expandidos facilmente.
-	# Usamos uma aproximação agrupando pela ordem dos colunas: primeiro todas numéricas (1:1), depois categóricas (expandem).
-	pre: ColumnTransformer = best_pipeline.named_steps["preprocessor"]
-	num_features = pre.transformers_[0][2]  # type: ignore
-	cat_features = pre.transformers_[1][2]  # type: ignore
-	num_count = len(num_features)
-	imp_means = r.importances_mean
-	imp_stds = r.importances_std
-
-	idx = 0
-	# numéricas: 1:1
-	for c in num_features:
-		importances_raw[c].append(float(imp_means[idx]))
-		idx += 1
-	# categóricas: várias colunas derivadas por categoria -> agregamos média
-	for c in cat_features:
-		# não sabemos quantas dummies geradas; estimamos pelo restante proporcional.
-		# Aqui, sem acesso direto aos nomes expandidos, fazemos uma aproximação:
-		# distribuímos igualmente o restante pelas categorias restantes.
-		# Para evitar inconsistência, paramos se acabarem as importâncias.
-		if idx >= len(imp_means):
-			break
-		importances_raw[c].append(float(imp_means[idx]))
-		idx += 1
-		while idx < len(imp_means) and len(cat_features) > 0 and (len(imp_means) - idx) >= (len(cat_features) - cat_features.index(c) - 1):
-			# Parada simples para não consumir todo o vetor por uma única feature
-			break
-
-	rows = []
-	for c, vals in importances_raw.items():
-		if not vals:
-			continue
-		rows.append({
-			"feature": c,
-			"importance_mean": float(np.mean(vals)),
-			"importance_std": float(np.std(vals)),
-		})
-	df_imp = pd.DataFrame(rows).sort_values("importance_mean", ascending=False)
-	return df_imp.head(max_features)
+    """O pipeline recebe colunas brutas, então há uma importância por coluna de RAW_INPUT_COLUMNS."""
+    result = permutation_importance(
+        pipeline,
+        X,
+        y,
+        scoring="roc_auc",
+        n_repeats=PERMUTATION_REPEATS,
+        random_state=random_state,
+    )
+    return (
+        pd.DataFrame(
+            {
+                "feature": list(X.columns),
+                "importance_mean": result.importances_mean,
+                "importance_std": result.importances_std,
+            }
+        )
+        .sort_values("importance_mean", ascending=False)
+        .reset_index(drop=True)
+    )
 
 
-def finalize_and_save(
-	best_name: str,
-	best_pipeline: Pipeline,
-	raw_feature_cols: List[str],
-	test_metrics: Dict[str, Any],
-	importances_df: Optional[pd.DataFrame] = None,
-) -> None:
-	dump(best_pipeline, os.path.join(MODEL_DIR, "best_model.joblib"))
-	metadata = {
-		"best_model_name": best_name,
-		"raw_feature_columns": raw_feature_cols,
-		"sklearn_version": pd.__version__,
-	}
-	with open(os.path.join(MODEL_DIR, "metadata.json"), "w", encoding="utf-8") as f:
-		json.dump(metadata, f, indent=2, ensure_ascii=False)
-	with open(os.path.join(REPORTS_DIR, "metrics.json"), "w", encoding="utf-8") as f:
-		json.dump(test_metrics, f, indent=2, ensure_ascii=False)
-	if importances_df is not None and not importances_df.empty:
-		importances_df.to_csv(os.path.join(REPORTS_DIR, "feature_importance.csv"), index=False, encoding="utf-8")
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
 
 
-def train_pipeline(
-	df: pd.DataFrame,
-	target_col: str = "readmit_30",
-	test_size: float = 0.2,
-	random_state: int = 42,
-) -> Dict[str, Any]:
-	"""
-	Orquestra treino/validação/teste, seleciona melhor modelo e salva artefatos.
-	Retorna dicionário com métricas de teste.
-	"""
-	# filtra colunas de entrada
-	all_features = select_feature_columns(df)
-	if not all_features:
-		raise ValueError("Nenhuma coluna de entrada encontrada após a engenharia de atributos.")
+def train_and_save(
+    cohort: pd.DataFrame,
+    model_dir: Path,
+    reports_dir: Path,
+    test_size: float = 0.2,
+    random_state: int = 42,
+    n_splits: int = CV_FOLDS,
+    classifiers: dict[str, BaseEstimator] | None = None,
+) -> dict[str, Any]:
+    """
+    Seleciona o modelo por validação cruzada agrupada, escolhe o limiar, reajusta
+    no treino completo, avalia uma vez no teste e grava os quatro artefatos.
+    """
+    candidates = classifiers if classifiers is not None else candidate_classifiers(random_state)
+    train, test = split_by_patient(cohort, test_size, random_state)
+    y_train = train[TARGET_COLUMN].to_numpy()
 
-	# split
-	X_trainval, X_test, y_trainval, y_test = split_data(df[all_features + [target_col]], target_col=target_col, test_size=test_size, random_state=random_state)
-	# segunda divisão para validação
-	X_train, X_val, y_train, y_val = train_test_split(
-		X_trainval, y_trainval, test_size=0.25, random_state=random_state, stratify=y_trainval
-	)  # 0.25 de 0.8 => 0.2 do total
+    results = {
+        name: cross_validate_candidate(clf, train, n_splits, random_state)
+        for name, clf in candidates.items()
+    }
+    cv_summary = {name: result.summary() for name, result in results.items()}
+    best_name = max(cv_summary, key=lambda name: cv_summary[name]["roc_auc_mean"])
+    threshold = choose_threshold(y_train, results[best_name].oof_proba)
 
-	# treina e seleciona
-	best_name, best_pipeline, val_scores = evaluate_models(X_train, y_train, X_val, y_val, raw_feature_cols=all_features)
+    X_train = train[list(RAW_INPUT_COLUMNS)]
+    X_test = test[list(RAW_INPUT_COLUMNS)]
+    y_test = test[TARGET_COLUMN].to_numpy()
+    pipeline = build_pipeline(candidates[best_name]).fit(X_train, y_train)
+    test_metrics = evaluate(y_test, pipeline.predict_proba(X_test)[:, 1], threshold)
+    importances = compute_permutation_importances(pipeline, X_test, y_test, random_state)
 
-	# avaliação no teste
-	test_proba = best_pipeline.predict_proba(X_test[all_features])[:, 1]
-	test_pred = (test_proba >= 0.5).astype(int)
-	test_auc = roc_auc_score(y_test, test_proba)
-	precision, recall, f1, _ = precision_recall_fscore_support(y_test, test_pred, average="binary", zero_division=0)
-	cm = confusion_matrix(y_test, test_pred).tolist()
-	report = classification_report(y_test, test_pred, output_dict=True, zero_division=0)
+    counts = {
+        "cohort_rows": int(len(cohort)),
+        "cohort_patients": int(cohort[GROUP_COLUMN].nunique()),
+        "train_rows": int(len(train)),
+        "train_patients": int(train[GROUP_COLUMN].nunique()),
+        "test_rows": int(len(test)),
+        "test_patients": int(test[GROUP_COLUMN].nunique()),
+    }
+    metadata = {
+        "model_name": best_name,
+        "raw_input_columns": list(RAW_INPUT_COLUMNS),
+        "threshold": threshold,
+        "sklearn_version": sklearn.__version__,
+        "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        **counts,
+    }
+    metrics = {
+        "best_model": best_name,
+        "split": (
+            f"teste = {test_size:.0%} dos pacientes (StratifiedGroupKFold por {GROUP_COLUMN}); "
+            f"seleção por CV de {n_splits} folds agrupada por paciente no treino"
+        ),
+        "cv_scores": cv_summary,
+        "threshold_selection": "máximo F1 nas probabilidades out-of-fold do modelo vencedor",
+        "test": test_metrics,
+        **counts,
+    }
 
-	test_metrics = {
-		"best_model": best_name,
-		"validation_scores_roc_auc": val_scores,
-		"test_roc_auc": float(test_auc),
-		"test_precision": float(precision),
-		"test_recall": float(recall),
-		"test_f1": float(f1),
-		"confusion_matrix": cm,
-		"classification_report": report,
-	}
-
-	# importâncias
-	try:
-		importances_df = compute_permutation_importances(best_pipeline, X_val, y_val, raw_feature_cols=all_features)
-	except Exception:
-		importances_df = None
-
-	finalize_and_save(best_name, best_pipeline, all_features, test_metrics, importances_df)
-	return test_metrics
-
-
+    model_dir.mkdir(parents=True, exist_ok=True)
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    dump(pipeline, model_dir / MODEL_FILENAME)
+    _write_json(model_dir / METADATA_FILENAME, metadata)
+    _write_json(reports_dir / METRICS_FILENAME, metrics)
+    importances.to_csv(reports_dir / IMPORTANCE_FILENAME, index=False, encoding="utf-8")
+    return metrics
