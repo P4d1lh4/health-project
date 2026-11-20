@@ -16,4 +16,7 @@ opendatasets>=0.1.22,<0.2
 kaggle>=1.6,<1.7
 pytest>=8,<9
 httpx>=0.27,<0.29
+shap>=0.54,<0.55
+ipykernel>=7,<8
+nbconvert>=7.17,<8
 

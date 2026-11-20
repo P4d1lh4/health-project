@@ -21,6 +21,9 @@ Health-Project/
 │  └─ main.py               # FastAPI
 ├─ dashboard/
 │  └─ app.py                # Streamlit
+├─ notebooks/
+│  ├─ 01_eda.ipynb          # exploração dos dados
+│  └─ 02_modelo_shap.ipynb  # calibração, limiar e SHAP
 ├─ tests/                   # pytest
 ├─ requirements.txt
 └─ README.md
@@ -176,6 +179,26 @@ Teste (XGBoost, avaliado uma vez):
 As colunas mais importantes por permutação são `number_inpatient` (queda de 0,074 na ROC-AUC) e `discharge_disposition_id` (0,050); as demais ficam abaixo de 0,008.
 
 ROC-AUC entre 0,64 e 0,68 é o típico para este dataset. O modelo ordena risco melhor que o acaso, mas não separa bem os casos: no limiar escolhido, cerca de 1 em cada 5 alertas é uma readmissão real. Um ROC-AUC bem acima de 0,72 aqui deve ser tratado como suspeita de vazamento, por exemplo o mesmo paciente em treino e teste.
+
+## Notebooks
+
+Os notebooks estão commitados com as saídas, então dá para ler sem executar.
+
+- `notebooks/01_eda.ipynb` explora a coorte: alvo, valores ausentes, pacientes repetidos e taxa de readmissão por variável.
+- `notebooks/02_modelo_shap.ipynb` avalia o modelo salvo no conjunto de teste: curva de calibração, efeito do limiar e explicação por SHAP. Rode o treino antes.
+
+Para executar de novo:
+
+```powershell
+python -m nbconvert --to notebook --execute --inplace notebooks/01_eda.ipynb
+python -m nbconvert --to notebook --execute --inplace notebooks/02_modelo_shap.ipynb
+```
+
+O que eles mostram:
+
+- O histórico de internações e o destino da alta concentram o sinal. A taxa de readmissão vai de 8,6% sem internações no ano anterior a 37,1% com cinco ou mais, e de 9,3% na alta para casa a 27,7% na alta para reabilitação.
+- As probabilidades estão bem calibradas: em dez faixas do teste, o previsto fica a menos de 2 pontos percentuais do observado.
+- No SHAP, `number_inpatient` (0,231) e `discharge_disposition_id` (0,226) têm o dobro da média de |SHAP| do terceiro atributo, o que concorda com a importância por permutação.
 
 ## Fonte do Dataset
 - Kaggle: `Prediction on Hospital Readmission` (arquivo `diabetic_data.csv`)
