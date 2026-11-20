@@ -14,12 +14,16 @@ from src.analysis import (
     threshold_for_share,
     threshold_summary,
 )
-from src.data_loading import TARGET_COLUMN, build_cohort
+from pathlib import Path
+
+from src.data_loading import TARGET_COLUMN, build_cohort, load_raw_data
 from src.explain import explain_record, source_feature
 from src.feature_engineering import EXAMPLE_INPUT, RAW_INPUT_COLUMNS
-from src.labels import DISCHARGE_LABELS, label_codes, value_label
+from src.labels import DISCHARGE_LABELS, MEDICAL_SPECIALTY_LABELS, label_codes, value_label
 from src.modeling import build_pipeline
 from tests.synthetic import make_raw_frame
+
+DATASET_PATH = Path(__file__).resolve().parents[1] / "data" / "diabetic_data.csv"
 
 
 def _cohort() -> pd.DataFrame:
@@ -106,8 +110,16 @@ def test_labels_fall_back_for_unknown_and_missing_values() -> None:
 
     assert codes.tolist() == ["Casa", "Código 99", "Não informado"]
     assert value_label("insulin", "Up") == "Dose aumentada"
-    assert value_label("medical_specialty", "Cardiology") == "Cardiology"
+    assert value_label("medical_specialty", "InternalMedicine") == "Clínica médica"
+    assert value_label("medical_specialty", "Especialidade-Nova") == "Especialidade-Nova"
     assert value_label("race", None) == "Não informado"
+
+
+@pytest.mark.skipif(not DATASET_PATH.exists(), reason="precisa do dataset em disco")
+def test_every_specialty_in_the_dataset_has_a_translation() -> None:
+    specialties = load_raw_data(DATASET_PATH)["medical_specialty"].dropna().unique()
+
+    assert sorted(set(specialties) - set(MEDICAL_SPECIALTY_LABELS)) == []
 
 
 def test_source_feature_picks_the_longest_matching_name() -> None:
